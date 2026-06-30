@@ -121,6 +121,12 @@ def ingest_url(req: IngestURLRequest):
 
     if not chunks:
         raise HTTPException(status_code=400, detail="No text extracted from URL")
+    
+
+    # in ingest_url, before the upsert:
+    existing = collection.get(where={"source": req.url}, include=[])
+    if existing["ids"]:
+        collection.delete(ids=existing["ids"])
 
     embeddings = embedder.encode(chunks, show_progress_bar=False).tolist()
     collection = get_collection(req.user_id)
@@ -167,9 +173,15 @@ async def ingest_file(
     if not chunks:
         raise HTTPException(status_code=400, detail="No text extracted")
 
-    embeddings = embedder.encode(chunks, show_progress_bar=False).tolist()
     collection = get_collection(user_id)
 
+    # remove any existing chunks for this exact filename before re-ingesting
+    # prevents duplicate/stale chunks when the same file is uploaded twice
+    existing = collection.get(where={"source": filename}, include=[])
+    if existing["ids"]:
+        collection.delete(ids=existing["ids"])
+
+    embeddings = embedder.encode(chunks, show_progress_bar=False).tolist()
     ids = [f"{filename}_{i}" for i in range(len(chunks))]
     collection.upsert(
         ids=ids,
@@ -196,6 +208,11 @@ def ingest_text(req: IngestTextRequest):
 
     if not chunks:
         raise HTTPException(status_code=400, detail="Empty content")
+    
+    # in ingest_text, before the upsert:
+    existing = collection.get(where={"source": req.source}, include=[])
+    if existing["ids"]:
+        collection.delete(ids=existing["ids"])
 
     embeddings = embedder.encode(chunks, show_progress_bar=False).tolist()
     collection = get_collection(req.user_id)
@@ -388,14 +405,30 @@ class DeleteDocumentRequest(BaseModel):
 def delete_document(req: DeleteDocumentRequest):
     """Delete all chunks for a specific source document."""
     collection = get_collection(req.user_id)
+
     results = collection.get(
         where={"source": req.source},
         include=["metadatas"],
     )
     ids = results["ids"]
+
+    print(f"Deleting {len(ids)} chunks for source '{req.source}' (user: {req.user_id})")
+
     if ids:
         collection.delete(ids=ids)
-    return {"deleted": len(ids), "source": req.source}
+
+    # verify deletion actually happened
+    verify = collection.get(where={"source": req.source}, include=[])
+    remaining = len(verify["ids"])
+
+    if remaining > 0:
+        print(f"WARNING: {remaining} chunks still remain after delete attempt")
+
+    return {
+        "deleted": len(ids),
+        "source": req.source,
+        "remaining": remaining,
+    }
 
 
 @app.delete("/user/{user_id}")
