@@ -4,6 +4,7 @@ from pydantic import BaseModel
 import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
+from collections import Counter
 import io
 import os
 import re
@@ -251,6 +252,106 @@ def query(req: QueryRequest):
         "distances": distances,
         "has_context": len(chunks) > 0,
     }
+
+
+class ScoredQueryRequest(BaseModel):
+    user_id: str
+    question: str
+    top_k: int = 8
+    boost_sources: list[dict] = []
+
+
+@app.post("/query/scored")
+def query_scored(req: ScoredQueryRequest):
+    """Retrieve chunks then apply score boosts from feedback history."""
+    collection = get_collection(req.user_id)
+    count = collection.count()
+
+    if count == 0:
+        return {"chunks": [], "sources": [], "has_context": False, "chunk_ids": []}
+
+    q_embedding = embedder.encode(
+        [req.question], show_progress_bar=False
+    ).tolist()
+
+    # ids are always returned by chroma — do NOT put "ids" in include
+    results = collection.query(
+        query_embeddings=q_embedding,
+        n_results=min(req.top_k, count),
+        include=["documents", "metadatas", "distances"],
+    )
+
+    chunks = results["documents"][0]
+    metadatas = results["metadatas"][0]
+    distances = results["distances"][0]
+    ids = results["ids"][0]  # always present regardless of include
+
+    # build boost map from feedback history
+    boost_map: dict[str, float] = {
+        b["source"]: b["score"] for b in req.boost_sources
+    }
+
+    # score = (1 - cosine_distance) + feedback_boost
+    scored = []
+    for i, chunk in enumerate(chunks):
+        source = metadatas[i].get("source", "")
+        base_score = 1 - distances[i]
+        boost = boost_map.get(source, 0.0)
+        final_score = base_score + (boost * 0.15)  # boost up to 15% weight
+        scored.append({
+            "chunk": chunk,
+            "source": source,
+            "score": final_score,
+            "id": ids[i],
+            "metadata": metadatas[i],
+        })
+
+    # re-rank by final score
+    scored.sort(key=lambda x: x["score"], reverse=True)
+
+    # return top 5 after re-ranking
+    top = scored[:5]
+
+    return {
+        "chunks": [s["chunk"] for s in top],
+        "sources": list({s["source"] for s in top}),
+        "chunk_ids": [s["id"] for s in top],
+        "scores": [s["score"] for s in top],
+        "has_context": len(top) > 0,
+    }
+
+
+class QueryExpansionRequest(BaseModel):
+    question: str
+    history: list[dict] = []
+
+
+@app.post("/expand-query")
+def expand_query(req: QueryExpansionRequest):
+    """
+    Simple query expansion — extracts key terms from conversation history
+    to make the current question more specific.
+    Uses no LLM, just NLP heuristics — keeps it free and fast.
+    """
+    combined = req.question
+    if req.history:
+        # extract nouns/key phrases from last 2 exchanges
+        recent = " ".join(
+            m["content"] for m in req.history[-4:] if m.get("role") == "user"
+        )
+        # add unique words from recent context that aren't in the current query
+        current_words = set(req.question.lower().split())
+        extra_words = [
+            w for w in recent.split()
+            if len(w) > 4 and w.lower() not in current_words
+            and re.match(r"^[a-zA-Z]+$", w)
+        ]
+        # take top 3 most frequent extra context words
+        top_extra = [w for w, _ in Counter(extra_words).most_common(3)]
+        if top_extra:
+            combined = req.question + " " + " ".join(top_extra)
+
+    return {"expanded_question": combined}
 
 
 class DocumentListRequest(BaseModel):
